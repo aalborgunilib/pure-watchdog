@@ -1,0 +1,126 @@
+#!/bin/bash
+
+#
+# CONFIG
+#
+
+WATCHDOGPATH="/data/tomcat_watchdog/enabled"
+LOGFILESPATH="/data/logfiles"
+CRASHPATH="/data/tomcat_watchdog/crash"
+
+# Which Pure instance is being monitored?
+case `hostname` in
+	srv-vbn-pure1 )
+		INSTANCE=admin ;;
+	srv-vbn-pure2 )
+		INSTANCE=portal ;;
+	srv-vbn-pure3 )
+		INSTANCE=projekter ;;
+	srv-vbn-pure4 )
+		INSTANCE=ws ;;
+	*)
+		echo "No Pure instance is defined for this host..."
+		exit 1
+		;;
+esac
+
+LOCKFILE="/data/tomcat_watchdog/lock/`hostname`_${INSTANCE}.pid"
+
+#
+# START UP AND REFORK AS DAEMON
+#
+
+# The watchdog must be running as root!
+if [ `id -u` -ne 0 ]; then
+	echo "Not running as root..."
+	exit 1
+fi
+
+# Only one watchdog is allowed to run at a time
+if [ -f "${LOCKFILE}" ]; then
+	echo "Already running or pid file was left over from a crash..."
+	exit 1
+fi
+
+# Deamonize the script
+MY_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+MY_FILE=$(basename $0)
+
+cd /
+
+# Check if this is the child process? Then refork
+if [ "$1" = "child" ] ; then
+	shift
+	umask 0
+	exec setsid $MY_DIR/$MY_FILE refork "$@" </dev/null >/dev/null 2>/dev/null &
+	exit 0
+fi
+# Check if this is the refork - else start as child
+if [ "$1" != "refork" ] ; then
+	exec $MY_DIR/$MY_FILE child "$@" &
+	exit 0
+fi
+
+# Redirect output and input
+exec >/dev/null
+exec 2>/dev/null
+exec 0</dev/null
+
+shift
+
+# Now we are running as daemon. Store the PID in the lock file
+echo -n "$$" > "${LOCKFILE}"
+
+# Trap EXIT to remove lock file
+trap cleanup EXIT
+
+# Remove lock file and exit nicely
+function cleanup {
+	rm "${LOCKFILE}"
+	logger -t "TOMCAT WATCHDOG[$$]" "Watchdog for Tomcat instance ${INSTANCE} on `hostname` was stopped"
+	exit 255
+}
+
+#
+# PROGRAM
+#
+
+# Log that we are running
+logger -t "TOMCAT WATCHDOG[$$]" "Setting up watchdog for Tomcat instance ${INSTANCE} on `hostname`"
+
+PIDCMD="ps aux | grep java | grep /data/tomcat/${INSTANCE}/conf/logging.properties | grep -v grep | awk '{print \$2}'"
+USERSCMD="users | wc -l"
+
+# Loop, loop, loop
+while : ; do
+	if [ -f "${WATCHDOGPATH}/${INSTANCE}" ]; then
+		PID=`eval $PIDCMD`
+		USERS=`eval $USERSCMD`
+
+		# Check if no tomcat pid exists
+		if [ ! -n "$PID" ]; then
+			# No user is logged in currently
+			if [ "$USERS" -eq 0 ]; then
+				logger -t "TOMCAT WATCHDOG[$$]" "Tomcat is not running. Watchdog is taking action!"
+				EPOCH=`date +%s`
+				# Take a backup of the logfiles
+				cp -r "${LOGFILESPATH}/tomcat_${INSTANCE}" "${CRASHPATH}/tomcat_${INSTANCE}@${EPOCH}"
+				# Start Tomcat
+				/etc/init.d/tomcat start
+				sleep 1m
+			# Users are logged in currently
+			else
+				logger -t "TOMCAT WATCHDOG[$$]" "Tomcat is not running but users are currently logged in. Watchdog is suspending action!"
+				sleep 1m
+			fi
+		# Tomcat is running fine
+		else
+			#logger -t "TOMCAT WATCHDOG[$$]" "Tomcat is running as it should!"
+			sleep 1m
+		fi
+	# Watchdog is disabled via file in WATCHDOGPATH
+	else
+		logger -t "TOMCAT WATCHDOG[$$]" "Tomcat is disabled!"
+		sleep 1m
+	fi
+done
